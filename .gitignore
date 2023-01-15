@@ -64,3 +64,9 @@ Data/Spain/Price/Prices_2019
 Data/Spain/Price/Prices_2020
 Data/Spain/Price/Prices_2021
 Data/Spain/Price/Prices_2022
+Data/*
+Dutch_Elec
+.gitignore
+Germany_Elec
+Spain_Elec
+.gitignore
