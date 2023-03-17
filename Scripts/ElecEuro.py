@@ -1,4 +1,4 @@
-# entsoe_helpers.py: various helpers for running regressions on entsoe data
+# ElecEuro.py: various helpers for running regressions on entsoe data
 # author: Ethan Reese
 # March 4, 2022
 
@@ -291,10 +291,10 @@ group_freq: the frequency of aggregation on the graphing for clarity purposes
 """
 def produce_graphs(coefs_pre, coefs_covid, coefs_war, country_name, input_data, log_adj, group_freq = "1W"):
         # calculate the columns based on each coefficient
-        combined_data = input_data[["Start", "Last Price", "Price", "Forecast"]]
+        combined_data = input_data[["Start", "Last Price", "Price", "Forecast"]].copy()
 
         
-        combined_data["Log LNG"] = combined_data["Last Price"].apply(np.log)
+        combined_data["Log LNG"] = np.log(combined_data["Last Price"]+log_adj)
         X = combined_data[["Log LNG", "Forecast"]]
 
         combined_data["Pre Covid Log Prediction"] = coefs_pre.predict(X)
@@ -309,6 +309,7 @@ def produce_graphs(coefs_pre, coefs_covid, coefs_war, country_name, input_data, 
         combined_data["Start"] = pd.to_datetime(combined_data["Start"])
         combined_data = combined_data.set_index("Start")
 
+
         period_avg = combined_data.groupby(pd.Grouper(freq=group_freq)).mean()
         fig = px.line(period_avg, x = period_avg.index, y=period_avg["Pre Covid Prediction"], title = 
                         "{} Actual vs. Predicted Electricity Cost Over Time".format(country_name))
@@ -317,7 +318,7 @@ def produce_graphs(coefs_pre, coefs_covid, coefs_war, country_name, input_data, 
 
         #fig.add_scatter(x = period_avg.index, y=period_avg["During COVID Prediction"], name = "During COVID Prediction")
 
-        fig.add_scatter(x = period_avg.index, y=period_avg["Price"]+log_adj, name="Actual")
+        fig.add_scatter(x = period_avg.index, y=period_avg["Price"] + log_adj, name="Actual")
 
         fig.show()
         
@@ -327,7 +328,7 @@ def produce_graphs(coefs_pre, coefs_covid, coefs_war, country_name, input_data, 
 Keyword Arguments:
 combined_data_path: path to the combined data frame in filesystem
 country_name: country under question for labelling
-log_adj: the proper log adjustment to apply for all log values
+log_adj (deprecated): the proper log adjustment to apply for all log values
 COVID_START: Start date for the COVID-19 Pandemic
 COVID_END: End date for the COVID-19 Pandemic period
 WAR_START: Start of war in Ukraine era
@@ -344,8 +345,10 @@ def timeperiod_differences(combined_data_path, country_name, log_adj=25, COVID_S
 
         # read in the data from the combined dataset
         data = pd.read_csv(combined_data_path)
+        log_adj = (-1 * min(np.min(data["Price"]), np.min(data["Last Price"]))) + 1
         data["Date"] = pd.to_datetime(data["Date"])
         pre_covid = data.loc[data["Date"] < COVID_START].copy()
+
 
         covid = data.loc[data["Date"] > COVID_START].copy()
         covid = covid.loc[covid["Date"] < COVID_END].copy()
@@ -359,29 +362,47 @@ def timeperiod_differences(combined_data_path, country_name, log_adj=25, COVID_S
         coefs_pre = filter_and_regress(pre_covid, country_name, log_adj=log_adj)
 
 
-        pre_covid["Log LNG"] = np.log(pre_covid["Last Price"])
+        pre_covid["Log LNG"] = np.log(pre_covid["Last Price"] + log_adj)
         X_pre = pre_covid[["Log LNG", "Forecast"]]
-        pre_covid["Log Elec"] = np.log(pre_covid["Price"])
+        pre_covid["Log Elec"] = np.log(pre_covid["Price"] + log_adj)
         print("R^2: {}".format(coefs_pre.score(X_pre, pre_covid["Price"])))
 
         print("COVID Era in {}".format(country_name))
         coefs_covid = filter_and_regress(covid, country_name, log_adj=log_adj)
 
-        covid["Log LNG"] = covid["Last Price"].apply(np.log)
+        covid["Log LNG"] = np.log(covid["Last Price"]+log_adj)
 
         X_cov = covid[["Log LNG", "Forecast"]]
-        covid["Log Elec"] = covid["Price"].apply(np.log)
+        covid["Log Elec"] = np.log(covid["Price"]+log_adj)
         print("R^2: {}".format(coefs_pre.score(X_cov, covid["Price"])))
 
         print("War in Ukraine Era in {}".format(country_name))
         coefs_war = filter_and_regress(war, country_name, log_adj=log_adj)
 
-        war["Log LNG"] = war["Last Price"].apply(np.log)
+        war["Log LNG"] = np.log(war["Last Price"]+log_adj)
         X_war = war[["Log LNG", "Forecast"]]
-        war["Log Elec"] = war["Price"].apply(np.log)
+        war["Log Elec"] = np.log(war["Price"]+log_adj)
         print("R^2: {}".format(coefs_pre.score(X_war, war["Price"])))
 
         if (country_name == "Germany"):
-                data = data[(data["Date"] < "2022-01-01") | (data["Date"]> "2022-03-01")]
+                data = data[(data["Date"] < "2022-01-01") | (data["Date"] > "2022-03-01")]
 
         produce_graphs(coefs_pre, coefs_covid, coefs_war, country_name, data, log_adj)
+
+""" betas_over_time: generate a plot of betas for the ng and demand terms using shortened rolling timeperiods
+
+Keyword Arugments:
+combined_data_path: path to the combined data frame in filesystem
+country_name: country under question for labelling
+log_adj (deprecated): the proper log adjustment to apply for all log values
+timeperiod_length: the length of the timeperiod to consider in the lookback for the regression (days)
+roll_forward: the number of days to roll forward between regressions
+"""
+def betas_over_time(combined_data_path, country_name, log_adj=25, timeperiod_length=200, roll_forward=50):
+        # read in the data from the combined dataset
+        data = pd.read_csv(combined_data_path)
+        log_adj = (-1 * min(np.min(data["Price"]), np.min(data["Last Price"]))) + 1
+        data["Date"] = pd.to_datetime(data["Date"])
+        
+        first_day = data["Date"].min()
+        last_day = data["Date"].max()
