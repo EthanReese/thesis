@@ -9,6 +9,11 @@ import datetime as dt
 import emd
 from sklearn import linear_model
 import plotly.express as px
+import multiprocessing
+from functools import partial
+
+from plotly.subplots import make_subplots
+import plotly.graph_objects as go
 
 """ Read and clean information about generator breakdowns
 
@@ -163,7 +168,9 @@ def read_and_clean(country, lng_path, area_suffix, coal_path = "./Bloomberg/Rott
         coal_data = coal_data[["Date", "Coal Price"]]
         # add the additional day to match up with the day ahead data
         combined = elec_merged.merge(lng_data, on="Date")
-        combined = combined.merge(coal_data, on = "Date");
+        combined = combined.merge(coal_data, on = "Date")
+
+        combined = combined.dropna(subset=["Forecast", "Actual"])
         
         combined.to_csv("./{}/combined_data.csv".format(country))
 
@@ -234,7 +241,7 @@ def filter_and_regress(combined_data, country,
 
         #px.scatter(x=low_pass_means_elec, y=low_pass_means_lng)
 
-
+        """
         med_pass_elec = imf[:, med_pass_thresh_elec:]
         med_pass_means_elec = np.apply_along_axis(np.mean, 1, med_pass_elec)
 
@@ -243,6 +250,7 @@ def filter_and_regress(combined_data, country,
 
         med_pass_demand = demand_imf[:, med_pass_thresh_demand:]
         med_pass_means_demand = np.apply_along_axis(np.mean, 1, med_pass_demand)
+        """
 
         #px.scatter(x=med_pass_means_elec, y=med_pass_means_lng)
         """
@@ -261,11 +269,12 @@ def filter_and_regress(combined_data, country,
         X_low_log["Log LNG"] = X_low_log["Log LNG"].apply(lambda x: np.log(x+log_adj))
         low_model = linear_model.LinearRegression().fit(X_low_log, np.log(low_pass_means_elec+log_adj))
         
-
+        """
         X_med = pd.DataFrame({"Log LNG": med_pass_means_lng, "Forecast": med_pass_means_demand})
         X_med_log = X_med.copy()
         X_med_log["Log LNG"] = X_med_log["Log LNG"].apply(lambda x: np.log(x+log_adj))
         med_model = linear_model.LinearRegression().fit(X_med_log, np.log(med_pass_means_elec + log_adj))
+        """
         if(verbose):
                 print("Low thresh LNG coefficient = {}, Demand Coefficient = {}".format(low_model.coef_[0], low_model.coef_[1]))
                 print("Med thresh LNG coefficient = {}, Demand Coefficient = {}".format(med_model.coef_[0], med_model.coef_[1]))
@@ -328,7 +337,7 @@ def produce_graphs(coefs_pre, coefs_covid, coefs_war, country_name, input_data, 
 Keyword Arguments:
 combined_data_path: path to the combined data frame in filesystem
 country_name: country under question for labelling
-log_adj (deprecated): the proper log adjustment to apply for all log values
+log_adj: the minimum adjustment for all log values
 COVID_START: Start date for the COVID-19 Pandemic
 COVID_END: End date for the COVID-19 Pandemic period
 WAR_START: Start of war in Ukraine era
@@ -336,7 +345,7 @@ WAR_START: Start of war in Ukraine era
 Shows a graph of the data with a fit line and prints information about the fit
 """
 # run regressions based on the timescales of COVID and war in Ukraine
-def timeperiod_differences(combined_data_path, country_name, log_adj=25, COVID_START = "2020-03-01",
+def timeperiod_differences(combined_data_path, country_name, log_adj=1, COVID_START = "2020-03-01",
         COVID_END = "2021-08-01", WAR_START = "2022-02-01"):
         # these serve as best guesses, change at will
         # 50% of Europe was vaccinated by this date: 
@@ -345,7 +354,11 @@ def timeperiod_differences(combined_data_path, country_name, log_adj=25, COVID_S
 
         # read in the data from the combined dataset
         data = pd.read_csv(combined_data_path)
-        log_adj = (-1 * min(np.min(data["Price"]), np.min(data["Last Price"]))) + 1
+
+        # make the protocol for adjusting log values
+        log_adj = max((-1 * min(np.min(data["Price"]), np.min(data["Last Price"]))) + 1, 30)
+
+        
         data["Date"] = pd.to_datetime(data["Date"])
         pre_covid = data.loc[data["Date"] < COVID_START].copy()
 
@@ -389,20 +402,106 @@ def timeperiod_differences(combined_data_path, country_name, log_adj=25, COVID_S
 
         produce_graphs(coefs_pre, coefs_covid, coefs_war, country_name, data, log_adj)
 
+""" iteration_helper: helper function for betas_over_time to enable parallelization
+
+Keyword Arguments:
+start_date: date to start analysis
+dataset: full dataset
+timeperiod_length: length of the timeperiod to consider
+roll_forward: timeperiod frequency to roll forward between periods
+log_adj: the log adjustment
+
+Returns a dictionary with the start date, LNG Beta, and demand beta
+"""
+def processing(data, country_name, timeperiod_length, roll_forward, log_adj, start_date):
+                end = start_date+dt.timedelta(days=timeperiod_length)
+
+                period = data[data["Date"] > start_date].copy()
+                period = period[period["Date"] < end].copy()
+
+                coefs_period = filter_and_regress(period, country_name, log_adj=log_adj, verbose=False)
+
+                period_row = {"Date": start_date, "Demand Beta": coefs_period.coef_[0], "LNG Beta": coefs_period.coef_[1]}
+                return period_row
+
+
+
 """ betas_over_time: generate a plot of betas for the ng and demand terms using shortened rolling timeperiods
 
 Keyword Arugments:
 combined_data_path: path to the combined data frame in filesystem
 country_name: country under question for labelling
-log_adj (deprecated): the proper log adjustment to apply for all log values
+log_adj: the minimal possible adjustment for all logs
 timeperiod_length: the length of the timeperiod to consider in the lookback for the regression (days)
-roll_forward: the number of days to roll forward between regressions
+roll_forward: the timeperiod frequency to roll forward between periods
+
+Returns a dataframe of the betas for the features over time
 """
-def betas_over_time(combined_data_path, country_name, log_adj=25, timeperiod_length=200, roll_forward=50):
+def betas_over_time(country_name, combined_data_path = " ", log_adj=1, timeperiod_length=720, roll_forward=25):
+        combined_data_path = "/Users/Ethan/Dev/Thesis Work/Data/{}/combined_data.csv".format(country_name)
         # read in the data from the combined dataset
         data = pd.read_csv(combined_data_path)
-        log_adj = (-1 * min(np.min(data["Price"]), np.min(data["Last Price"]))) + 1
+
+        log_adj = max((-1 * min(np.min(data["Price"]), np.min(data["Last Price"]))) + 1, log_adj)
         data["Date"] = pd.to_datetime(data["Date"])
         
         first_day = data["Date"].min()
         last_day = data["Date"].max()
+        
+        date_range = pd.date_range(start=first_day, end=last_day, freq="{}D".format(roll_forward))
+        
+        beta_list = []
+        
+        partial_processing= partial(processing, data, country_name, timeperiod_length, roll_forward, log_adj)
+        """
+        for start in date_range:
+                end = start+dt.timedelta(days=timeperiod_length)
+
+                period = data[data["Date"] > start].copy()
+                period = period[period["Date"] < end].copy()
+
+                coefs_period = filter_and_regress(period, country_name, log_adj=log_adj, verbose=False)
+
+                period_row = {"Date": start, "Demand Beta": coefs_period.coef_[0], "LNG Beta": coefs_period.coef_[1]}
+                beta_list.append(period_row)
+        """
+        with multiprocessing.Pool() as pool:
+                beta_list = pool.map(partial_processing, date_range)
+        betas_over_time = pd.DataFrame(beta_list)
+        fig = px.line(betas_over_time, x = betas_over_time["Date"], y=betas_over_time["LNG Beta"], title = 
+                        "{} LNG Betas Over Time".format(country_name))
+        fig.show()
+        fig = px.line(betas_over_time, x = betas_over_time["Date"], y=betas_over_time["Demand Beta"], title = 
+                        "{} Demand Betas Over Time".format(country_name))
+        fig.show()
+
+        return betas_over_time
+
+
+"""scatter_gen: generate a scatter plot for the given country between percent natural gas used and elec price
+
+Keyword Arguments:
+country_name: name of country to plot
+
+returns null
+"""
+def scatter_gen(country_name):
+
+        # first read in the generator information and combine it with the gas information
+        gen_df = gen_read_clean(country_name)
+        aggregated_df = combine_gen_gas(country_name, gen_df, freq="1H")
+
+        fig = make_subplots(rows=1, cols=2, subplot_titles=("Gas Total vs. Elec Price", 
+                                                        "Gas Percent vs. Elec Price"))
+        
+        fig.add_trace(go.Scatter(x=aggregated_df["Total"], y=np.log(aggregated_df["Price"]), mode="markers", opacity=0.4, 
+                                text = aggregated_df["Start"], hovertemplate="%{text}"),
+                        row=1, col=1)
+        
+        fig.add_trace(go.Scatter(x=aggregated_df["Percent Gas"], y=np.log(aggregated_df["Price"]), mode="markers", opacity=0.4, 
+                                text = aggregated_df["Start"], hovertemplate="%{text}"),
+                        row=1, col=2)
+        
+        fig.update_layout(height=800, width=1300, title_text=country_name)
+
+        fig.show()
