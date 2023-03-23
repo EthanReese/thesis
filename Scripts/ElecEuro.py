@@ -97,7 +97,7 @@ data_path: path to the top data file in the
 returns a combined, cleaned directory with commodity and elec prices
 also writes this file to the country's data directory
 """
-def read_and_clean(country, lng_path, area_suffix, coal_path = "./Bloomberg/Rotterdam Coal.xlsx",
+def read_and_clean(country, lng_path, area_suffix, coal_path = "/Users/Ethan/Dev/Thesis Work/Data/European Coal.csv",
                 data_path = "/Users/Ethan/Dev/Thesis Work/Data"):
         init_directory = os.getcwd()
         # start by iterating and reading in all of the files
@@ -162,16 +162,25 @@ def read_and_clean(country, lng_path, area_suffix, coal_path = "./Bloomberg/Rott
         # filter columns
         lng_data = lng_data[["Date", "Last Price"]]
 
-        ## READ IN COAL DATA FROM BLOOMBERG
-        coal_data = pd.read_excel(coal_path)
-        coal_data["Coal Price"] = coal_data["Last Price"]
+        ## READ IN COAL DATA FROM BLOOMBERG NEF
+        coal_data = pd.read_csv(coal_path)
+        coal_data["Coal Price"] = coal_data["Time Series: Price"]
+        # there are some recent missing days, so fill in those values with interpolation
+        coal_data["Coal Price"] = coal_data["Coal Price"].interpolate()
+        coal_data = coal_data.rename(columns={"Timeseries: Date Axis": "Date"})
+
+        coal_data["Date"] = pd.to_datetime(coal_data["Date"])
+
+        
         coal_data = coal_data[["Date", "Coal Price"]]
-        # add the additional day to match up with the day ahead data
+
         combined = elec_merged.merge(lng_data, on="Date")
         combined = combined.merge(coal_data, on = "Date")
 
         combined = combined.dropna(subset=["Forecast", "Actual"])
         
+        combined = combined.merge(coal_data, on="Date", how="left")
+
         combined.to_csv("./{}/combined_data.csv".format(country))
 
         os.chdir(init_directory)
@@ -195,10 +204,12 @@ def filter_and_regress(combined_data, country,
         low_pass_percent=0.2, med_pass_percent=0.5, high_pass_percent=0.5, log_adj=20,
         verbose = True):
         
-        combined_data = combined_data[["Last Price", "Price", "Forecast"]]
+        combined_data = combined_data[["Last Price", "Price", "Forecast", "Coal Price_x"]]
+        combined_data = combined_data.rename(columns={"Coal Price_x": "Coal Price"})
         combined_data = combined_data.dropna(axis=0)
         elec_price = combined_data["Price"].to_numpy()
         lng_price = combined_data["Last Price"].to_numpy()
+        coal_price = combined_data["Coal Price"].to_numpy()
         demand = combined_data["Forecast"].to_numpy()
         # plot and transform all of the data for electricity pricing
         #plt.figure()
@@ -229,6 +240,9 @@ def filter_and_regress(combined_data, country,
         low_pass_thresh_demand = int(np.ceil(low_pass_percent * demand_imf.shape[1]))
         med_pass_thresh_demand = int(np.ceil(med_pass_percent * demand_imf.shape[1]))
         high_pass_thresh_demand = int(np.ceil(high_pass_percent * demand_imf.shape[1]))
+
+        coal_imf, coal_noise = emd.sift.complete_ensemble_sift(coal_price, ensemble_noise=1)
+        low_pass_thresh_coal = int(np.ceil(low_pass_percent * coal_imf.shape[1]))
         
         low_pass_elec = imf[:, low_pass_thresh_elec:]
         low_pass_means_elec = np.apply_along_axis(np.mean, 1, low_pass_elec)
@@ -238,6 +252,9 @@ def filter_and_regress(combined_data, country,
 
         low_pass_demand = demand_imf[:, low_pass_thresh_demand:]
         low_pass_means_demand = np.apply_along_axis(np.mean, 1, low_pass_demand)
+
+        low_pass_coal = coal_imf[:, low_pass_thresh_coal:]
+        low_pass_means_coal = np.apply_along_axis(np.mean, 1, low_pass_coal)
 
         #px.scatter(x=low_pass_means_elec, y=low_pass_means_lng)
 
@@ -264,9 +281,10 @@ def filter_and_regress(combined_data, country,
         high_pass_means_demand = np.apply_along_axis(np.mean, 1, high_pass_demand)
         """
         #px.scatter(x=high_pass_means_elec, y=high_pass_means_lng)
-        X_low = pd.DataFrame({"Log LNG": low_pass_means_lng, "Forecast": low_pass_means_demand})
+        X_low = pd.DataFrame({"Log LNG": low_pass_means_lng, "Log Coal": low_pass_means_coal, "Forecast": low_pass_means_demand})
         X_low_log = X_low.copy()
         X_low_log["Log LNG"] = X_low_log["Log LNG"].apply(lambda x: np.log(x+log_adj))
+        X_low_log["Log Coal"] = X_low_log["Log Coal"].apply(lambda x: np.log(x + log_adj))
         low_model = linear_model.LinearRegression().fit(X_low_log, np.log(low_pass_means_elec+log_adj))
         
         """
@@ -276,8 +294,8 @@ def filter_and_regress(combined_data, country,
         med_model = linear_model.LinearRegression().fit(X_med_log, np.log(med_pass_means_elec + log_adj))
         """
         if(verbose):
-                print("Low thresh LNG coefficient = {}, Demand Coefficient = {}".format(low_model.coef_[0], low_model.coef_[1]))
-                print("Med thresh LNG coefficient = {}, Demand Coefficient = {}".format(med_model.coef_[0], med_model.coef_[1]))
+                print("Low thresh LNG coefficient = {}, Coal Coefficient = {}, Demand Coefficient = {}".format(low_model.coef_[0], low_model.coef_[1], low_model.coef_[1]))
+                #print("Med thresh LNG coefficient = {}, Demand Coefficient = {}".format(med_model.coef_[0], med_model.coef_[1]))
         """
         X_high = pd.DataFrame({"LNG": high_pass_means_lng, "Demand": high_pass_means_demand})
         X_high_log = X_high.copy()
@@ -344,7 +362,7 @@ WAR_START: Start of war in Ukraine era
 
 Shows a graph of the data with a fit line and prints information about the fit
 """
-# run regressions based on the timescales of COVID and war in Ukraine
+# TODO: Update for Coal
 def timeperiod_differences(combined_data_path, country_name, log_adj=1, COVID_START = "2020-03-01",
         COVID_END = "2021-08-01", WAR_START = "2022-02-01"):
         # these serve as best guesses, change at will
@@ -356,7 +374,7 @@ def timeperiod_differences(combined_data_path, country_name, log_adj=1, COVID_ST
         data = pd.read_csv(combined_data_path)
 
         # make the protocol for adjusting log values
-        log_adj = max((-1 * min(np.min(data["Price"]), np.min(data["Last Price"]))) + 1, 30)
+        log_adj = max((-1 * min(np.min(data["Price"]), np.min(data["Last Price"]))) + 1, log_adj)
 
         
         data["Date"] = pd.to_datetime(data["Date"])
@@ -421,7 +439,7 @@ def processing(data, country_name, timeperiod_length, roll_forward, log_adj, sta
 
                 coefs_period = filter_and_regress(period, country_name, log_adj=log_adj, verbose=False)
 
-                period_row = {"Date": start_date, "Demand Beta": coefs_period.coef_[0], "LNG Beta": coefs_period.coef_[1]}
+                period_row = {"Date": end, "Demand Beta": coefs_period.coef_[0], "LNG Beta": coefs_period.coef_[1]}
                 return period_row
 
 
@@ -437,7 +455,7 @@ roll_forward: the timeperiod frequency to roll forward between periods
 
 Returns a dataframe of the betas for the features over time
 """
-def betas_over_time(country_name, combined_data_path = " ", log_adj=1, timeperiod_length=720, roll_forward=25):
+def betas_over_time(country_name, combined_data_path = " ", log_adj=1, timeperiod_length=365, roll_forward=25, produce_graphs = True):
         combined_data_path = "/Users/Ethan/Dev/Thesis Work/Data/{}/combined_data.csv".format(country_name)
         # read in the data from the combined dataset
         data = pd.read_csv(combined_data_path)
@@ -468,12 +486,13 @@ def betas_over_time(country_name, combined_data_path = " ", log_adj=1, timeperio
         with multiprocessing.Pool() as pool:
                 beta_list = pool.map(partial_processing, date_range)
         betas_over_time = pd.DataFrame(beta_list)
-        fig = px.line(betas_over_time, x = betas_over_time["Date"], y=betas_over_time["LNG Beta"], title = 
-                        "{} LNG Betas Over Time".format(country_name))
-        fig.show()
-        fig = px.line(betas_over_time, x = betas_over_time["Date"], y=betas_over_time["Demand Beta"], title = 
-                        "{} Demand Betas Over Time".format(country_name))
-        fig.show()
+        if(produce_graphs):
+                fig = px.line(betas_over_time, x = betas_over_time["Date"], y=betas_over_time["LNG Beta"], title = 
+                                "{} LNG Betas Over Time".format(country_name))
+                fig.show()
+                fig = px.line(betas_over_time, x = betas_over_time["Date"], y=betas_over_time["Demand Beta"], title = 
+                                "{} Demand Betas Over Time".format(country_name))
+                fig.show()
 
         return betas_over_time
 
@@ -494,14 +513,116 @@ def scatter_gen(country_name):
         fig = make_subplots(rows=1, cols=2, subplot_titles=("Gas Total vs. Elec Price", 
                                                         "Gas Percent vs. Elec Price"))
         
-        fig.add_trace(go.Scatter(x=aggregated_df["Total"], y=np.log(aggregated_df["Price"]), mode="markers", opacity=0.4, 
+        fig.add_trace(go.Scatter(x=aggregated_df["Total"], y=aggregated_df["Price"], mode="markers", opacity=0.4, 
                                 text = aggregated_df["Start"], hovertemplate="%{text}"),
                         row=1, col=1)
         
-        fig.add_trace(go.Scatter(x=aggregated_df["Percent Gas"], y=np.log(aggregated_df["Price"]), mode="markers", opacity=0.4, 
+        fig.add_trace(go.Scatter(x=aggregated_df["Percent Gas"], y=aggregated_df["Price"], mode="markers", opacity=0.4, 
                                 text = aggregated_df["Start"], hovertemplate="%{text}"),
                         row=1, col=2)
         
         fig.update_layout(height=800, width=1300, title_text=country_name)
 
         fig.show()
+
+
+def get_covid_df(country_name):
+        covid_df = pd.read_csv("/Users/ethan/Dev/Thesis Work/Data/vaccinations.csv")
+
+        country_covid_df = covid_df[covid_df["location"] == country_name]
+        country_covid_df["date"] = pd.to_datetime(country_covid_df["date"])
+
+        return country_covid_df
+
+""" incorporate_covid_data: add the data from the covid dataset to the existing electricity price data
+
+Keyword Arguments:
+country_name: name of the country under question
+
+returns a dataframe including various vaccine rate data about the country in question.
+"""
+def incorporate_covid_data(country_name):
+        country_covid_df = get_covid_df(country_name)
+
+        elec_df = pd.read_csv("/Users/Ethan/Dev/Thesis Work/Data/{}/combined_data.csv".format(country_name))
+        elec_df["Date"] = pd.to_datetime(elec_df["Date"])
+        #elec_df = elec_df.set_index("Date")
+
+        #elec_df = elec_df.groupby(pd.Grouper(freq="1W")).mean()
+
+        merged_df = pd.merge(elec_df, country_covid_df, right_on="date", left_on="Date", how="left", sort=True)
+        
+        merged_df = merged_df[merged_df["date"] > "2020-03-01"]
+        merged_df["people_vaccinated"] = merged_df["people_vaccinated"].ffill()
+        merged_df = merged_df.fillna(0)
+
+        return merged_df
+
+
+""" covid_graphs: make various graphs about the covid data that I presently find interesting 
+
+Keyword Arguments:
+country_name: name of the country to graph
+
+displays the current graphs that I'm interested in for the given country
+"""
+def covid_graphs(country_name):
+        #df = incorporate_covid_data(country_name)
+        
+        """
+        fig = px.scatter(df, x = "people_vaccinated", y="Price", title=country_name)
+        fig.show()
+        """
+        #df["Date"] = pd.to_datetime(df["Date"])
+        #df = df.set_index("Date")
+        #df = df.groupby(pd.Grouper(freq="1W")).mean()
+        
+        covid_df = get_covid_df(country_name)
+
+        beta_df = betas_over_time(country_name, roll_forward=7, produce_graphs=False)
+
+        merged_df = pd.merge_asof(beta_df, covid_df, left_on="Date", right_on="date", tolerance = dt.timedelta(weeks=2))
+
+        merged_df = merged_df.fillna(0)
+
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+        fig.add_trace(
+                go.Scatter(x=merged_df["Date"], y=merged_df["Demand Beta"]), secondary_y=False
+        )
+
+        fig.add_trace(
+                go.Scatter(x=merged_df["Date"], y=merged_df["people_vaccinated"]), secondary_y=True
+        )
+
+        fig.show()
+        """
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        fig.add_trace(
+                go.Scatter(x=df.index, y=df["Price"], name = "Electricity Price"),
+                secondary_y=False
+        )
+
+        fig.add_trace(
+                go.Scatter(x=df.index, y=df["people_vaccinated"], name="Vaccinations"),
+                secondary_y=True
+        )
+
+        fig.show()
+        """
+
+""" score_model: fits a given linear model for a given country
+
+Keyword Arguments:
+country_name: country name for figure heading and accessing data
+group_freq: the frequency to group by in stadard dt coding
+log_adj: minimum value for log adjustment. Only use if errors persist.
+
+prints scoring information and displays figure
+returns null
+"""
+def score_model(country_name, group_freq="1W", log_adj=1):
+        data = pd.read_csv(os.path.join("/Users","Ethan","Dev","Thesis Work","Data",country_name,"combined_data.csv"))
+        model = filter_and_regress(data, country_name)
+
+        X = data["Date"]
