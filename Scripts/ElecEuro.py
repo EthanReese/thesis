@@ -13,6 +13,7 @@ import multiprocessing
 from functools import partial
 from scipy.optimize import curve_fit
 import matplotlib.pyplot as plt
+import sklearn
 
 from plotly.subplots import make_subplots
 import plotly.graph_objects as go
@@ -118,9 +119,8 @@ def read_and_clean(country, lng_path, area_suffix, coal_path = "/Users/Ethan/Dev
         total_caps["Year"] = cap_t["Year"].astype(int)
         total_caps["Coal Capacity"] = cap_t["Fossil Hard coal"].astype(int) + cap_t["Fossil Brown coal/Lignite"].astype(int)
         total_caps["LNG Capacity"] = cap_t["Fossil Gas"]
-        total_caps["Renewable Capacity"] = cap_t["Biomass"].astype(int) + cap_t["Hydro Run-of-river and poundage"].astype(int) + \
-                cap_t["Hydro Water Reservoir"].astype(int) + cap_t["Solar"].astype(int) + cap_t["Nuclear"].astype(int) + \
-                cap_t["Other renewable"].astype(int) + cap_t["Wind Offshore"].astype(int) + cap_t["Wind Onshore"].astype(int)
+        total_caps["Dispatch Renewable Capacity"] = cap_t["Hydro Run-of-river and poundage"].astype(int) + \
+                cap_t["Hydro Water Reservoir"].astype(int) + cap_t["Nuclear"].astype(int)
 
 
         # start by iterating and reading in all of the files
@@ -131,6 +131,7 @@ def read_and_clean(country, lng_path, area_suffix, coal_path = "/Users/Ethan/Dev
                 price_data.append(pd.read_csv(file))
 
         prices = pd.concat(price_data)
+        prices.to_csv("./prices.csv")
 
         # general clean up
         prices = prices.dropna(subset=["Day-ahead Price [EUR/MWh]"])
@@ -185,7 +186,12 @@ def read_and_clean(country, lng_path, area_suffix, coal_path = "/Users/Ethan/Dev
         forecasts = pd.concat(forecast_data)
         forecasts_clean = pd.DataFrame()
         forecasts_clean["Start"] = forecasts["MTU (CET/CEST)"].apply(lambda x: x.split("-")[0])
-        forecasts_clean["Total Ren"] = forecasts.iloc[:, 1] + forecasts.iloc[:, 2] + forecasts.iloc[:, 3]
+        forecasts = forecasts.fillna(0)
+        forecasts = forecasts.replace(to_replace="-", value=0)
+        forecasts = forecasts.replace(to_replace=r'[^0-9.-]+', value=0, regex=True)
+
+        forecasts_clean["Total Ren"] = forecasts.iloc[:, 1].astype(int) + forecasts.iloc[:, 2].astype(int) \
+                + forecasts.iloc[:, 3].astype(int)
 
         os.chdir(os.path.join("..",".."))
 
@@ -209,7 +215,7 @@ def read_and_clean(country, lng_path, area_suffix, coal_path = "/Users/Ethan/Dev
         coal_data["Coal Price"] = coal_data["Coal Price"].interpolate()
         coal_data = coal_data.rename(columns={"Timeseries: Date Axis": "Date"})
 
-        coal_data["Date"] = pd.to_datetime(coal_data["Date"]) - dt.timedelta(days=1)
+        coal_data["Date"] = pd.to_datetime(coal_data["Date"])
 
         
         coal_data = coal_data[["Date", "Coal Price"]]
@@ -371,7 +377,11 @@ def get_X_aid(dataframe, log_adj, time_start=0, time_end=23):
         X["Log LNG"] = dataframe["Last Price"]
         X["Log Coal"] = dataframe["Coal Price_x"]
         X["Forecast"] = dataframe["Forecast"]
-        X["Capacity"] = dataframe["Coal Capacity"] + dataframe["LNG Capacity"] + dataframe["Total Ren"]
+        X["Capacity"] = dataframe["Coal Capacity"] + dataframe["LNG Capacity"] + dataframe["Total Ren"] +\
+        dataframe["Dispatch Renewable Capacity"]
+        X["Coal Employed"] = ((dataframe["Forecast"] - (dataframe["Total Ren"] + dataframe["Dispatch Renewable Capacity"])) > 0).astype(int)
+        X["LNG Employed"] = ((dataframe["Forecast"]) - (dataframe["Total Ren"] + dataframe["Dispatch Renewable Capacity"] + dataframe["Coal Capacity"]) > 0).astype(int)
+        X["Const"] = ((dataframe["Forecast"] - (dataframe["Total Ren"] + dataframe["Dispatch Renewable Capacity"])) < 0).astype(int)
 
         # properly break into the daily elements based on the period of the day considered.
 
@@ -381,31 +391,98 @@ def get_X_aid(dataframe, log_adj, time_start=0, time_end=23):
         
         return X, actual, timeseries
 
-def aid_function(X, gamma, nu, lng_beta, coal_beta):
+def model_function(X, gamma, nu, lng_beta, coal_beta, ren_beta):
         # convention for maximum price of electricity
         M= 3000
-        #if (X[:, 2] <= X[:, 3]):
-        return (gamma/((X[:, 3]-X[:, 2])**nu)) * (lng_beta*X[:, 0] + coal_beta*X[:, 1])
-        #else:
-                #return M*(lng_beta*X[:, 0] + coal_beta*X[:, 1])
+        # C^max - D
+        scarcity = X[:, 3]-X[:, 2]
+        val = np.piecewise(scarcity, [scarcity > 0, scarcity <= 0],
+                     [lambda scarcity: np.clip(gamma/(np.power(scarcity, nu)), a_min = 0, a_max=M),
+                        M])
+        return val * (lng_beta*X[:, 0]*X[:, 5]  + coal_beta*X[:, 1]*(X[:, 4]-X[:,5]) + ren_beta*X[:,6])
 
 
-def aid_regression(combined_data, country, log_adj, time_start=7, time_end=11):
+
+def aid_regression(combined_data, country, log_adj, time_start=7, time_end=11, graphs = True, verbose = "a"):
+        output_str = ""
+        time_output = ""
+        COVID_START = "2020-03-01"
+        COVID_END = "2021-06-01"
+        WAR_START = "2022-02-01"
         log_adj = max((-1 * min(np.min(combined_data["Price"]), np.min(combined_data["Last Price"]))) + 2, log_adj)
         combined_data = combined_data.dropna(axis=0)
 
         combined_data["Start"] = pd.to_datetime(combined_data["Start"])
         combined_data = combined_data.sort_values(by="Start")
 
+
         X, actual, ts = get_X_aid(combined_data, log_adj, time_start=time_start, time_end = time_end)
-        popt, pcov = curve_fit(aid_function, X.values, actual.values)
-        print(popt)
-        print(pcov)
+        popt, pcov = curve_fit(model_function, X.values, actual.values, maxfev=10000)
+        output_str += ", ".join(str(i) for i in popt)
+        output_str += "\n"
 
-        fig = px.line(x = ts, y= actual, title = country)
-        fig.add_scatter(x=ts, y=aid_function(X.values, *popt), name = "Pred")
-        fig.show()
+        time_output += output_str
+        #print(pcov)
 
+        scarcity = X["Capacity"].values - X["Forecast"].values
+        val = np.piecewise(scarcity, [scarcity > 0, scarcity <= 0],
+                     [lambda scarcity: np.clip(popt[0]/(np.power(scarcity, popt[1])), a_min = 0, a_max=3000),
+                        3000])
+        
+        output_str += "g: {}".format(np.mean(val))
+        df = pd.DataFrame({"Timeseries": ts, "Actual": actual, "Pred": model_function(X.values, *popt)})
+        df["Timeseries"] = pd.to_datetime(df["Timeseries"])
+        output_str += "{} R^2: {} \n".format(country, sklearn.metrics.r2_score(df["Actual"], df["Pred"]))
+        if verbose == "time":
+                pre = df.loc[df["Timeseries"] < COVID_START].copy()
+                print(pre)
+                
+                covid = df.loc[df["Timeseries"] > COVID_START].copy()
+                covid = covid.loc[covid["Timeseries"] < COVID_END].copy()
+
+                war = df[df["Timeseries"] > WAR_START].copy()
+
+                time_output += "{} Pre-Covid R^2: {} \n".format(country, sklearn.metrics.r2_score(pre["Actual"], pre["Pred"]))
+                time_output += "{} Covid R^2: {} \n".format(country, sklearn.metrics.r2_score(covid["Actual"], covid["Pred"]))
+                time_output += "{} War R^2: {} \n".format(country, sklearn.metrics.r2_score(war["Actual"], war["Pred"]))
+
+
+                print(time_output)
+        df.set_index("Timeseries", inplace=True)
+        df = df.dropna(axis=0)
+        df = df.resample("W").mean()
+        df.reset_index(inplace=True)
+        if graphs:
+                #fig = px.line(df, x = "Timeseries", y= "Actual", title = country, name="Actual")
+                fig = px.line(title=country)
+                fig.add_scatter(x = df["Timeseries"], y= df["Actual"], name="Actual")
+                fig.add_scatter(x=df["Timeseries"], y=df["Pred"], name = "Predicted")
+                #fig.update_yaxes(type="log")
+                fig.update_yaxes(title = "Marginal Price (€/MWh)")
+                fig.update_xaxes(title = "Date")
+                fig.update_layout(legend=dict(
+                        yanchor="top",
+                        y=0.99,
+                        xanchor="left",
+                        x=0.01
+                        ))
+                fig.show()
+        df = df.dropna(axis=0)
+        output_str += "{} R^2: {} \n".format(country, sklearn.metrics.r2_score(df["Actual"], df["Pred"]))
+        if verbose == "a": 
+                print(output_str)
+
+
+        return output_str
+
+
+
+def carmona_regression(combined_data, country, log_adj, time_start, time_end, graphs=False):
+        log_adj = max((-1 * min(np.min(combined_data["Price"]), np.min(combined_data["Last Price"]))) + 2, log_adj)
+        combined_data = combined_data.dropna(axis=0)
+
+        combined_data["Start"] = pd.to_datetime(combined_data["Start"])
+        combined_data = combined_data.sort_values(by="Start")
 
 
 """ Produce graphs based on the coefficients calculated by the regression
@@ -474,7 +551,7 @@ def timeperiod_differences(country_name, log_adj=1, COVID_START = "2020-03-01",
         
         combined_data_path = os.path.join("/Users", "Ethan", "Dev", "Thesis Work", "Data", country_name, "combined_data.csv")
 
-        time_blocks = {0:6, 7:11, 12:16, 17:20, 21:23}
+        time_blocks = {2:3, 7:8, 12:13, 18:19, 21:22}
         # read in the data from the combined dataset
         data = pd.read_csv(combined_data_path)
 
@@ -547,6 +624,51 @@ def timeperiod_differences(country_name, log_adj=1, COVID_START = "2020-03-01",
 
         produce_graphs(coefs_pre, coefs_covid, coefs_war, country_name, data, log_adj)
         """
+def aid_timeperiod_differences(country_name, log_adj=1, COVID_START = "2020-03-01",
+        COVID_END = "2021-06-01", WAR_START = "2022-02-01"):
+        # these serve as best guesses, change at will
+        # 50% of Europe was vaccinated by this date: 
+        # https://www.bbc.com/news/explainers-52380823
+        
+        combined_data_path = os.path.join("/Users", "Ethan", "Dev", "Thesis Work", "Data", country_name, "combined_data.csv")
+
+        # time_blocks = {2:3, 8:9, 12:13, 18:19}
+        time_blocks = {18:19}
+        # read in the data from the combined dataset
+        data = pd.read_csv(combined_data_path)
+
+        # make the protocol for adjusting log values
+        log_adj = max((-1 * min(np.min(data["Price"]), np.min(data["Last Price"]))) + 1, log_adj)
+
+        
+        data["Date"] = pd.to_datetime(data["Date"])
+        pre_covid = data.loc[data["Date"] < COVID_START].copy()
+
+
+        covid = data.loc[data["Date"] > COVID_START].copy()
+        covid = covid.loc[covid["Date"] < COVID_END].copy()
+
+        war = data[data["Date"] > WAR_START].copy()
+
+        # run the regressions on the given datasets
+        
+        output_str = ""
+        
+        for start in time_blocks.keys():
+                output_str += "Coefficients for {} to {} \n".format(start, time_blocks[start])
+
+                output_str += "Pre-COVID in {} \n".format(country_name)
+                output_str += aid_regression(pre_covid, country_name, log_adj, time_start=start, time_end = time_blocks[start], graphs = True, verbose = False)
+
+
+                output_str += "COVID Era in {} \n".format(country_name)
+                output_str += aid_regression(covid, country_name, log_adj, time_start=start, time_end = time_blocks[start], graphs = False, verbose = False)
+
+                output_str += "War Era in {} \n".format(country_name)
+                output_str += aid_regression(war, country_name, log_adj, time_start=start, time_end = time_blocks[start], graphs = False, verbose = False)
+                output_str += "\n"
+        print(output_str)
+        return output_str
 
 """ iteration_helper: helper function for betas_over_time to enable parallelization
 
@@ -576,12 +698,8 @@ def processing(data, country_name, timeperiod_length, roll_forward, log_adj, tim
                         coefs_period = unfiltered_regression(period, country_name, log_adj, time_start=key, time_end=time_blocks[key])
                         X, actual = get_X(period, log_adj, time_start = key, time_end = time_blocks[key])
                         score = coefs_period.score(X, actual)
-                        period_row.append({"Date": end, "Start": key, "LNG Beta": coefs_period.coef_[0], "Coal Beta": coefs_period.coef_[1], "Demand Beta": coefs_period.coef_[2], "R^2": score})
-                
-
-                
-
-
+                        period_row.append({"Date": end, "Start": key, "LNG Beta": coefs_period.coef_[0], 
+                                           "Coal Beta": coefs_period.coef_[1], "Demand Beta": coefs_period.coef_[2], "R^2": score})
                 
                 return period_row
 

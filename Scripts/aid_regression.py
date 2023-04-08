@@ -1,8 +1,15 @@
 from ElecEuro import *
+import multiprocessing
 
-countries = ["Germany", "Netherlands"]
+countries = ["France", "Germany", "Netherlands", "Spain"]
+
+def Processing(country):
+    data = pd.read_csv(os.path.join("/Users", "Ethan", "Dev", "Thesis Work", "Data", country, "combined_data.csv"))
+    aid_regression(data, country, time_start=17, time_end=18, log_adj=0, verbose="a")
 
 if __name__ == "__main__":
-    for country in countries:
-        data = pd.read_csv(os.path.join("/Users", "Ethan", "Dev", "Thesis Work", "Data", country, "combined_data.csv"))
-        aid_regression(data, country, time_start=8, time_end=9, log_adj=5)
+        lst = []
+        with multiprocessing.Pool() as pool:
+                lst = pool.map(Processing, countries)
+        
+        print(lst)
