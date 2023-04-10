@@ -1,7 +1,7 @@
 from ElecEuro import *
 import os
 
-countries = ["Austria", "Spain", "France", "Netherlands", "Germany"]
+countries = ["Spain", "France", "Netherlands", "Germany"]
 
 area_suffixes = {
         "France": "BZN|FR",

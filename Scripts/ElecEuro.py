@@ -120,8 +120,10 @@ def read_and_clean(country, lng_path, area_suffix, coal_path = "/Users/Ethan/Dev
         total_caps["Coal Capacity"] = cap_t["Fossil Hard coal"].astype(int) + cap_t["Fossil Brown coal/Lignite"].astype(int)
         total_caps["LNG Capacity"] = cap_t["Fossil Gas"]
         total_caps["Dispatch Renewable Capacity"] = cap_t["Hydro Run-of-river and poundage"].astype(int) + \
-                cap_t["Hydro Water Reservoir"].astype(int) + cap_t["Nuclear"].astype(int)
+                cap_t["Nuclear"].astype(int) + cap_t["Hydro Water Reservoir"].astype(int)
 
+        total_caps["Wind Onshore Total"] = cap_t["Wind Onshore"].astype(int)
+        total_caps["Solar Total"] = cap_t["Solar"].astype(int)
 
         # start by iterating and reading in all of the files
         price_data = []
@@ -377,10 +379,10 @@ def get_X_aid(dataframe, log_adj, time_start=0, time_end=23):
         X["Log LNG"] = dataframe["Last Price"]
         X["Log Coal"] = dataframe["Coal Price_x"]
         X["Forecast"] = dataframe["Forecast"]
-        X["Capacity"] = dataframe["Coal Capacity"] + dataframe["LNG Capacity"] + dataframe["Total Ren"] +\
-        dataframe["Dispatch Renewable Capacity"]
-        X["Coal Employed"] = ((dataframe["Forecast"] - (dataframe["Total Ren"] + dataframe["Dispatch Renewable Capacity"])) > 0).astype(int)
+        X["Capacity"] = (dataframe["Coal Capacity"] + dataframe["LNG Capacity"] + dataframe["Total Ren"] +\
+        dataframe["Dispatch Renewable Capacity"])
         X["LNG Employed"] = ((dataframe["Forecast"]) - (dataframe["Total Ren"] + dataframe["Dispatch Renewable Capacity"] + dataframe["Coal Capacity"]) > 0).astype(int)
+        X["Coal Employed"] = ((dataframe["Forecast"] - (dataframe["Total Ren"] + dataframe["Dispatch Renewable Capacity"])) > 0).astype(int) - X["LNG Employed"]
         X["Const"] = ((dataframe["Forecast"] - (dataframe["Total Ren"] + dataframe["Dispatch Renewable Capacity"])) < 0).astype(int)
 
         # properly break into the daily elements based on the period of the day considered.
@@ -397,9 +399,9 @@ def model_function(X, gamma, nu, lng_beta, coal_beta, ren_beta):
         # C^max - D
         scarcity = X[:, 3]-X[:, 2]
         val = np.piecewise(scarcity, [scarcity > 0, scarcity <= 0],
-                     [lambda scarcity: np.clip(gamma/(np.power(scarcity, nu)), a_min = 0, a_max=M),
+                     [lambda scarcity: np.clip(np.divide(gamma,(np.power(scarcity, nu)), out = np.ones_like(scarcity) * M, where=(np.power(scarcity, nu))>0.01), a_min = 0, a_max=M),
                         M])
-        return val * (lng_beta*X[:, 0]*X[:, 5]  + coal_beta*X[:, 1]*(X[:, 4]-X[:,5]) + ren_beta*X[:,6])
+        return val * (lng_beta*X[:, 0]*X[:, 4]  + coal_beta*X[:, 1]*X[:, 5] + ren_beta*X[:,6])
 
 
 
@@ -417,19 +419,21 @@ def aid_regression(combined_data, country, log_adj, time_start=7, time_end=11, g
 
 
         X, actual, ts = get_X_aid(combined_data, log_adj, time_start=time_start, time_end = time_end)
-        popt, pcov = curve_fit(model_function, X.values, actual.values, maxfev=10000)
+        popt, pcov = curve_fit(model_function, X.values, actual.values, p0=[10, 1, 1, 1, 1], maxfev=5000)
         output_str += ", ".join(str(i) for i in popt)
         output_str += "\n"
 
         time_output += output_str
-        #print(pcov)
+        min_price = np.sum(actual < 0)
+                #print(pcov)
 
         scarcity = X["Capacity"].values - X["Forecast"].values
         val = np.piecewise(scarcity, [scarcity > 0, scarcity <= 0],
                      [lambda scarcity: np.clip(popt[0]/(np.power(scarcity, popt[1])), a_min = 0, a_max=3000),
                         3000])
         
-        output_str += "g: {}".format(np.mean(val))
+        output_str += "Number of Days: {} \n".format(len(actual))
+        output_str += "g: {} \n".format(np.mean(val))
         df = pd.DataFrame({"Timeseries": ts, "Actual": actual, "Pred": model_function(X.values, *popt)})
         df["Timeseries"] = pd.to_datetime(df["Timeseries"])
         output_str += "{} R^2: {} \n".format(country, sklearn.metrics.r2_score(df["Actual"], df["Pred"]))
@@ -473,7 +477,7 @@ def aid_regression(combined_data, country, log_adj, time_start=7, time_end=11, g
                 print(output_str)
 
 
-        return output_str
+        return output_str, df
 
 
 
@@ -625,7 +629,7 @@ def timeperiod_differences(country_name, log_adj=1, COVID_START = "2020-03-01",
         produce_graphs(coefs_pre, coefs_covid, coefs_war, country_name, data, log_adj)
         """
 def aid_timeperiod_differences(country_name, log_adj=1, COVID_START = "2020-03-01",
-        COVID_END = "2021-06-01", WAR_START = "2022-02-01"):
+        COVID_END = "2021-06-01", WAR_START = "2021-06-02"):
         # these serve as best guesses, change at will
         # 50% of Europe was vaccinated by this date: 
         # https://www.bbc.com/news/explainers-52380823
@@ -644,6 +648,9 @@ def aid_timeperiod_differences(country_name, log_adj=1, COVID_START = "2020-03-0
         data["Date"] = pd.to_datetime(data["Date"])
         pre_covid = data.loc[data["Date"] < COVID_START].copy()
 
+        inter_crisis = data.loc[data["Date"] > COVID_END].copy()
+        inter_crisis = inter_crisis[inter_crisis["Date"] < WAR_START].copy()
+        pre_covid = pd.concat([pre_covid, inter_crisis])
 
         covid = data.loc[data["Date"] > COVID_START].copy()
         covid = covid.loc[covid["Date"] < COVID_END].copy()
@@ -658,15 +665,54 @@ def aid_timeperiod_differences(country_name, log_adj=1, COVID_START = "2020-03-0
                 output_str += "Coefficients for {} to {} \n".format(start, time_blocks[start])
 
                 output_str += "Pre-COVID in {} \n".format(country_name)
-                output_str += aid_regression(pre_covid, country_name, log_adj, time_start=start, time_end = time_blocks[start], graphs = True, verbose = False)
+                string_add, df_pre = aid_regression(pre_covid, country_name, log_adj, time_start=start, time_end = time_blocks[start], graphs = False, verbose = False) 
+                output_str += string_add
 
 
                 output_str += "COVID Era in {} \n".format(country_name)
-                output_str += aid_regression(covid, country_name, log_adj, time_start=start, time_end = time_blocks[start], graphs = False, verbose = False)
+                string_add, df_covid = aid_regression(covid, country_name, log_adj, time_start=start, time_end = time_blocks[start], graphs = False, verbose = False) 
+                output_str += string_add
 
                 output_str += "War Era in {} \n".format(country_name)
-                output_str += aid_regression(war, country_name, log_adj, time_start=start, time_end = time_blocks[start], graphs = False, verbose = False)
+                string_add, df_war = aid_regression(war, country_name, log_adj, time_start=start, time_end = time_blocks[start], graphs = False, verbose = False) 
+                output_str += string_add
                 output_str += "\n"
+        df_pre["Era"] = "red"
+        df_covid["Era"] = "green"
+        df_war["Era"] = "purple"
+        df = pd.concat([df_pre, df_covid, df_war]) 
+        df.set_index("Timeseries", inplace=True)
+        df.sort_index(inplace=True)
+        print(df)
+
+        fig = go.Figure()
+
+        fig.add_trace(go.Scatter(x=df.index, y=df["Actual"], name = "Actual"))
+        fig.add_trace(go.Scatter(x=df.index, y=df["Pred"], mode= "lines+markers", marker = dict(color = df["Era"].values), name = "Prediction"))
+        
+
+        fig.update_yaxes(title = "Marginal Price (€/MWh)")
+        fig.update_xaxes(title = "Date")
+        fig.update_layout(legend=dict(
+                        yanchor="top",
+                        y=0.99,
+                        xanchor="left",
+                        x=0.01
+                        ), title = country_name, font = dict(size=20))
+        
+        COVID_END = pd.to_datetime(COVID_END)
+        war_start= 500
+        if country_name == "Spain": 
+                war_start = 300
+
+        fig.add_annotation(x = COVID_START, y= 250, text = "Covid Start", showarrow=False)
+        fig.add_annotation(x = COVID_END, y=250, text = "Covid End", showarrow=False)
+        fig.add_annotation(x = WAR_START, y= war_start, text = "War Start", showarrow=False)
+
+
+        fig.show()
+        output_str += "Overall R^2: {}".format(sklearn.metrics.r2_score(df["Actual"], df["Pred"]))
+
         print(output_str)
         return output_str
 

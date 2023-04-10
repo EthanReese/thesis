@@ -5,7 +5,7 @@ countries = ["France", "Germany", "Netherlands", "Spain"]
 
 def Processing(country):
     data = pd.read_csv(os.path.join("/Users", "Ethan", "Dev", "Thesis Work", "Data", country, "combined_data.csv"))
-    aid_regression(data, country, time_start=17, time_end=18, log_adj=0, verbose="a")
+    aid_regression(data, country, time_start=18, time_end=19, log_adj=0, verbose="a")
 
 if __name__ == "__main__":
         lst = []
